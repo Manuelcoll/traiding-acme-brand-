@@ -20,6 +20,7 @@ button{font:inherit;border:0;cursor:pointer;color:inherit}
 #sp{flex:1}
 #chartwrap{flex:1;min-height:0;position:relative}
 #under{position:absolute;left:0;top:0;z-index:0;pointer-events:none}
+#over{position:absolute;left:0;top:0;z-index:2;pointer-events:none}
 #cv{position:absolute;inset:0;z-index:1}
 #legend{position:absolute;left:8px;top:6px;z-index:3;pointer-events:none;font-variant-numeric:tabular-nums}
 #price{font-size:20px;font-weight:800}
@@ -71,6 +72,7 @@ h4{font-size:12px;color:var(--mu);font-weight:600;margin:8px 0 6px}
 <div id="chartwrap">
   <canvas id="under"></canvas>
   <div id="cv"></div>
+  <canvas id="over"></canvas>
   <div id="legend"><div><span id="price">--</span><span id="chg"></span></div><div id="ohlc"></div></div>
   <div id="toast"></div>
   <div id="loading">Cargando gráfico...</div>
@@ -122,6 +124,173 @@ const LABEL={cripto:"Cripto",metales:"Metales",indices:"Índices",forex:"Forex",
 const TFS=[["1m","1min","1m"],["5m","5min","5m"],["15m","15min","15m"],["30m","30min","30m"],["1h","1h","1h"],["4h","4h","4h"],["1D","1day","1d"],["1W","1week","1w"]];
 const AUTO=["hour","hour","hour","hour","day","day","month","month"];
 const MAJOR={hour:"day",day:"month",week:"month",month:"year",year:null};
+const USEC={hour:3600,day:86400,week:604800,month:2629800,year:31557600};
+const LEVS=[[10,.18],[25,.24],[50,.30],[100,.38]];
+const RED=[239,83,80],BLUE=[41,98,255];
+const COL=["#e0a100","#2962ff","#9c27b0","#00a68e","#ff6d00","#689f38","#ec407a","#0288d1"];
+const TH={
+ light:{bg:"#ffffff",bg2:"#eef0f4",bg3:"#e1e4ea",tx:"#131722",mu:"#6a7385",bd:"#e0e3eb",up:"#089981",dn:"#f23645",grid:"#eef0f4",axis:"#131722",div:"rgba(90,104,135,.30)",divM:"rgba(90,104,135,.62)",cross:"#9598a1",vu:"rgba(8,153,129,.35)",vd:"rgba(242,54,69,.35)"},
+ dark:{bg:"#0b0e11",bg2:"#1e2329",bg3:"#2b3139",tx:"#ffffff",mu:"#848e9c",bd:"#1e2329",up:"#26a69a",dn:"#ef5350",grid:"#161b22",axis:"#b7bdc6",div:"rgba(132,142,156,.24)",divM:"rgba(132,142,156,.55)",cross:"#758696",vu:"rgba(38,166,154,.45)",vd:"rgba(239,83,80,.45)"}
+};
+const MES=["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"],DIA=["dom","lun","mar","mié","jue","vie","sáb"];
+const pad=n=>String(n).padStart(2,"0");
+const $=id=>document.getElementById(id);
+const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+const jget=(k,d)=>{try{return JSON.parse(store.get(k))||d}catch(e){return d}};
+const TZ=-new Date().getTimezoneOffset()*60;
+
+let st=jget("st",{}),cat=ASSETS[st.cat]?st.cat:"cripto",sym=st.sym||"BTCUSDT",tf=(st.tf>=0&&st.tf<TFS.length)?st.tf:4;
+let ind=Object.assign({ema:[[9,0],[21,1],[50,0],[200,0]],vol:1,liq:0,don:0,donP:20,bb:0,bbP:20,rsi:0,rsiP:14,macd:0,book:0,bookS:1},jget("ind",{}));
+let cfg=Object.assign({theme:"light",fs:14,div:"auto",logo:1,logoOp:.16},jget("cfg",{}));
+const CLAVE_OK=/^[A-Za-z0-9]{16,}$/.test(CLAVE_TWELVE.trim());
+let key=CLAVE_OK?CLAVE_TWELVE.trim():(store.get("td_key")||""),pc=cat;
+let chart,candles,vol,ws=null,emaS={},ovS={},ovData={},subs={},syncing=false,logoOk=false,book=null,bookRev=0,bookT=null,bars=[],last=null,refPrice=null,prevClose=null,curTime=0,dyn=false,reqId=0,menu=null,sig="";
+const T=()=>TH[cfg.theme];
+const logoImg=new Image();logoImg.onload=()=>{logoOk=true;sig=""};logoImg.onerror=()=>{logoOk=false;sig=""};logoImg.src="img/logo.png";
+const isB=()=>/USDT$/.test(sym);
+const sh=()=>tf<6?TZ:0;
+const dig=p=>p>=100?2:p>=10?3:p>=1?5:6;
+const fmt=p=>p.toLocaleString("en-US",{minimumFractionDigits:dig(p),maximumFractionDigits:dig(p)});
+const save=()=>{store.set("st",JSON.stringify({cat,sym,tf}));store.set("ind",JSON.stringify(ind))};
+const saveCfg=()=>store.set("cfg",JSON.stringify(cfg));
+const dispSym=s=>/USDT$/.test(s)?s.replace("USDT","/USDT"):s;
+const unit=()=>cfg.div==="auto"?AUTO[tf]:cfg.div;
+
+function initChart(){
+  const t=T();
+  chart=LightweightCharts.createChart($("cv"),{
+    layout:{background:{type:"solid",color:"rgba(0,0,0,0)"},textColor:t.axis,fontSize:cfg.fs,attributionLogo:false},
+    grid:{vertLines:{visible:false},horzLines:{color:t.grid}},
+    rightPriceScale:{borderColor:t.bd,minimumWidth:84,scaleMargins:{top:.14,bottom:.2}},
+    timeScale:{borderColor:t.bd,timeVisible:true,secondsVisible:false,rightOffset:6,
+      tickMarkFormatter:(time,type)=>{
+        const d=new Date(time*1000);
+        if(type===0)return String(d.getUTCFullYear());
+        if(type===1)return MES[d.getUTCMonth()];
+        if(type===2)return d.getUTCDate()+" "+MES[d.getUTCMonth()];
+        return pad(d.getUTCHours())+":"+pad(d.getUTCMinutes());
+      }},
+    localization:{timeFormatter:time=>{
+      const d=new Date(time*1000),s=`${DIA[d.getUTCDay()]} ${d.getUTCDate()} ${MES[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+      return tf>=6?s:s+` ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`}},
+    crosshair:{mode:1,vertLine:{color:t.cross},horzLine:{color:t.cross}},
+    handleScroll:{pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false}
+  });
+  candles=chart.addCandlestickSeries({upColor:t.up,downColor:t.dn,wickUpColor:t.up,wickDownColor:t.dn,borderVisible:false});
+  vol=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"v",visible:!!ind.vol});
+  chart.priceScale("v").applyOptions({scaleMargins:{top:.85,bottom:0}});
+  chart.subscribeCrosshairMove(p=>{
+    const d=p.time&&p.seriesData.get(candles);
+    if(d)setOhlc(d);else if(bars.length)setOhlc(bars[bars.length-1]);
+  });
+  chart.timeScale().subscribeVisibleLogicalRangeChange(r=>syncRange(chart,r));
+  new ResizeObserver(()=>{chart.applyOptions({width:$("chartwrap").clientWidth,height:$("chartwrap").clientHeight});sig=""}).observe($("chartwrap"));
+  requestAnimationFrame(frame);
+}
+function applyTheme(){
+  const t=T(),r=document.documentElement.style;
+  ["bg","bg2","bg3","tx","mu","bd"].forEach(k=>r.setProperty("--"+k,t[k]));
+  $("bTheme").textContent=cfg.theme==="light"?"☾":"☀";
+  if(chart){
+    chart.applyOptions({layout:{textColor:t.axis,fontSize:cfg.fs},grid:{horzLines:{color:t.grid}},rightPriceScale:{borderColor:t.bd},timeScale:{borderColor:t.bd},crosshair:{vertLine:{color:t.cross},horzLine:{color:t.cross}}});
+    candles.applyOptions({upColor:t.up,downColor:t.dn,wickUpColor:t.up,wickDownColor:t.dn});
+    paintVol();
+    Object.values(subs).forEach(x=>x.chart.applyOptions(subOpts()));
+    if(bars.length){syncSubs();setPrice(bars[bars.length-1])}
+  }
+  sig="";
+}
+function paintVol(){vol.setData(bars.map(d=>({time:d.time,value:d.volume,color:d.close>=d.open?T().vu:T().vd})))}
+function setOhlc(b){$("ohlc").textContent=`O ${fmt(b.open)}  H ${fmt(b.high)}  L ${fmt(b.low)}  C ${fmt(b.close)}`}
+function setPrice(b){
+  const c=prevClose?(b.close-prevClose)/prevClose*100:0,t=T();
+  $("price").textContent=fmt(b.close);$("price").style.color=b.close>=b.open?t.up:t.dn;
+  $("chg").textContent=(c>=0?"+":"")+c.toFixed(2)+"%";$("chg").style.color=c>=0?t.up:t.dn;
+  setOhlc(b);
+}
+function bar(){$("bAsset").textContent=dispSym(sym)+" ▾";$("bTf").textContent=TFS[tf][0]+" ▾"}
+
+/* ---------- capa de fondo: zonas de liquidación y divisiones ---------- */
+function l2t(l){
+  const n=bars.length;if(n<2)return bars[0].time;
+  if(l<=0)return bars[0].time+l*(bars[1].time-bars[0].time);
+  if(l>=n-1)return bars[n-1].time+(l-(n-1))*(bars[n-1].time-bars[n-2].time);
+  const i=Math.floor(l);return bars[i].time+(l-i)*(bars[i+1].time-bars[i].time);
+}
+function t2l(t){
+  const n=bars.length;let lo=0,hi=n;
+  while(lo<hi){const m=(lo+hi)>>1;if(bars[m].time<t)lo=m+1;else hi=m}
+  if(n<2)return 0;
+  if(lo===0)return(t-bars[0].time)/(bars[1].time-bars[0].time);
+  if(lo===n)return(n-1)+(t-bars[n-1].time)/(bars[n-1].time-bars[n-2].time);
+  return(lo-1)+(t-bars[lo-1].time)/(bars[lo].time-bars[lo-1].time);
+}
+function nextB(u,t){
+  const d=new Date(t*1000);
+  if(u==="hour")return(Math.floor(t/3600)+1)*3600;
+  if(u==="day")return(Math.floor(t/86400)+1)*86400;
+  if(u==="week"){const day=Math.floor(t/86400),dow=(day+3)%7;return(day+(7-dow))*86400}
+  if(u==="month")return Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+1,1)/1000;
+  return Date.UTC(d.getUTCFullYear()+1,0,1)/1000;
+}
+function isMajor(u,t){
+  const d=new Date(t*1000);
+  if(u==="hour")return d.getUTCHours()===0;
+  if(u==="day")return d.getUTCDate()===1;
+  if(u==="week")return d.getUTCDate()<=7;
+  if(u==="month")return d.getUTCMonth()===0;
+  return false;
+}
+function frame(){
+  requestAnimationFrame(frame);
+  if(!chart||!bars.length)return;
+  const W=$("chartwrap").clientWidth,H=$("chartwrap").clientHeight,lr=chart.timeScale().getVisibleLogicalRange();
+  if(!lr||!W||!H)return;
+  let psw=56,tsh=30;
+  try{psw=chart.priceScale("right").width();tsh=chart.timeScale().height()}catch(e){}
+  const y0=refPrice?candles.priceToCoordinate(refPrice):null,y1=refPrice?candles.priceToCoordinate(refPrice*1.05):null;
+  const s=[W,H,psw,tsh,lr.from.toFixed(2),lr.to.toFixed(2),y0,y1,ind.liq,isB(),cfg.theme,cfg.div,tf,bars.length,refPrice,last,curTime,ind.don,ind.donP,ind.bb,ind.bbP,cfg.logo,cfg.logoOp,logoOk,bookRev,ind.book,ind.bookS].join("|");
+  Object.values(subs).forEach(x=>{if(x.w!==psw){x.w=psw;x.chart.applyOptions({rightPriceScale:{minimumWidth:psw}})}});
+  if(s===sig)return;sig=s;
+  draw(W,H,psw,tsh,lr);
+  drawOver(W,H,psw,tsh);
+}
+function draw(W,H,psw,tsh,lr){
+  const cv=$("under"),dpr=window.devicePixelRatio||1;
+  if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);cv.style.width=W+"px";cv.style.height=H+"px"}
+  const c=cv.getContext("2d");c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,W,H);
+  const pw=W-psw,ph=H-tsh;
+  c.save();c.beginPath();c.rect(0,0,pw,ph);c.clip();
+  /* divisiones verticales */
+  let u=unit();
+  const tFrom=l2t(lr.from),tTo=l2t(lr.to);
+  if((tTo-tFrom)/USEC[u]>400&&MAJOR[u])u=MAJOR[u];
+  const ts=chart.timeScale(),T0=T();let t=nextB(u,tFrom-1),n=0,lastX=-99;
+  while(t<=tTo&&n++<500){
+    const x=ts.logicalToCoordinate(t2l(t)),mj=isMajor(u,t);
+    if(x!=null&&x>=0&&x<=pw&&(mj||x-lastX>=22)){
+      c.fillStyle=mj?T0.divM:T0.div;c.fillRect(Math.round(x),0,mj?2:1,ph);lastX=x;
+    }
+    t=nextB(u,t);
+  }
+  /* relleno de bandas (Donchian y Bollinger) */
+  [["don","41,98,255"],["bb","156,39,176"]].forEach(([k,rgb])=>{
+    if(!ind[k]||!ovData[k])return;
+    const U=ovData[k][k+"U"],L=ovData[k][k+"L"],i0=Math.max(0,Math.floor(lr.from)),i1=Math.min(bars.length-1,Math.ceil(lr.to)),up=[],lo=[];
+    for(let i=i0;i<=i1;i++){
+      if(!U[i]||!L[i]||U[i].value===undefined||L[i].value===undefined)continue;
+      const x=ts.logicalToCoordinate(i),yu=candles.priceToCoordinate(U[i].value),yl=candles.priceToCoordinate(L[i].value);
+      if(x==null||yu==null||yl==null)continue;up.push([x,yu]);lo.push([x,yl]);
+    }
+    if(up.length<2)return;
+    c.beginPath();up.forEach((p,j)=>j?c.lineTo(p[0],p[1]):c.moveTo(p[0],p[1]));
+    for(let j=lo.length-1;j>=0;j--)c.lineTo(lo[j][0],lo[j][1]);
+    c.closePath();c.fillStyle=`rgba(${rgb},.08)`;c.fill();
+  });
+  /* zonas de liquidación (estimadas) */
+  if(ind.liq&&isB()&&refPrice){
+    LEVS.forEach(([x,a])=>{
+      [[1+1/x,RED],[1-1/x,BLUE]].forEachnth",month:"year",year:null};
 const USEC={hour:3600,day:86400,week:604800,month:2629800,year:31557600};
 const LEVS=[[10,.18],[25,.24],[50,.30],[100,.38]];
 const RED=[239,83,80],BLUE=[41,98,255];
